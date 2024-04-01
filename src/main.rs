@@ -1,69 +1,69 @@
 use clap::Parser;
 use hyper::{
-    body::{Body, Bytes},
     client::connect::HttpConnector,
     client::Client,
-    Method, Request, StatusCode,
 };
-use packed_struct::PackedStruct;
 use svc_telemetry_client_rest::netrid_types::*;
-use geo::prelude::*;
-use geo::point;
+use svc_atc_client_rest::types::*;
+
+mod orders;
+mod parcel;
+mod telemetry;
+
+use telemetry::*;
+use orders::*;
 
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
     /// Name of the person to greet
-    #[arg(long)]
-    host: String,
+    // #[arg(long)]
+    // host: String,
 
-    /// Number of times to greet
+    /// telemetry service port
     #[arg(long)]
-    port: u16,
-}
+    tlm_port: u16,
 
-#[derive(Debug)]
-pub struct PointZ {
+    /// atc service port
+    #[arg(long)]
+    atc_port: u16,
+
+    /// cargo service port
+    #[arg(long)]
+    cargo_port: u16,
+
+    /// aircraft name
+    #[arg(long)]
+    name: String,
+
+    /// aircraft uuid
+    #[arg(long)]
+    uuid: String,
+
+    /// starting longitude
+    #[arg(long)]
     longitude: f64,
+
+    /// starting latitude
+    #[arg(long)]
     latitude: f64,
-    altitude: f64,
+
+    /// scanner id
+    #[arg(long)]
+    scanner_id: String
 }
 
 pub enum Activity {
     Idle,
     Cruise,
 }
-
-pub enum Connectivity {
-    Connected,
-    Disconnected,
-}
-
-pub enum NetworkError {
-    Unauthorized,
-    Other,
-}
-
-const SLEEP_TIME_MS: u64 = 100;
-
-impl std::fmt::Display for NetworkError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            NetworkError::Unauthorized => write!(f, "Unauthorized"),
-            NetworkError::Other => write!(f, "Other"),
-        }
-    }
-}
-
-struct FlightPlan {
-    id: String,
-    path: Vec<(PointZ, u64)>,
-}
+const SLEEP_TIME_MS: u64 = 50;
 
 struct State {
     current_plan: Option<FlightPlan>,
     id: String,
+    scanner_id: String,
     token: Option<String>,
     activity: Activity,
     position: PointZ,
@@ -76,287 +76,32 @@ struct State {
     // operational: bool, // for simulating sudden out of service
 }
 
-async fn acquire_token(
-    client: &Client<HttpConnector>,
-    base_url: &str,
-    identifier: String,
-) -> Result<String, NetworkError> {
-    let url = format!("{base_url}/login");
-
-    println!("| {identifier} | acquiring token from {url}.");
-    // acquire token
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(url)
-        .header("content-type", "text/plain")
-        .body(Bytes::from(identifier.clone()).into())
-        .unwrap();
-
-    let res = client.request(req).await.map_err(|e| {
-        println!("({identifier}) could not acquire token: {}", e);
-        NetworkError::Other
-    })?;
-
-    if res.status() != StatusCode::OK {
-        println!("({identifier}) could not acquire token: {}", res.status());
-        return Err(NetworkError::Unauthorized);
-    };
-
-    let body = hyper::body::to_bytes(res.into_body()).await.map_err(|e| {
-        println!("({identifier}) could not process token stream: {}", e);
-        NetworkError::Other
-    })?;
-
-    let token = String::from_utf8(body.to_vec())
-        .map_err(|e| {
-            println!("({identifier}) could not convert token to string: {}", e);
-            NetworkError::Other
-        })?
-        .trim_matches('"')
-        .replace("\"", "");
-
-    println!("| {identifier} | acquired token.");
-    Ok(token)
-}
-
-async fn id_update(
-    client: &Client<HttpConnector>,
-    url: &str,
-    identifier: &str,
-    token: &str,
-) -> Result<(), NetworkError> {
-    // issue id update
-    let Ok(uas_id) = <[u8; 20]>::try_from(format!("{:>20}", identifier).as_ref()) else {
-        panic!("({identifier} could not convert identifier to [u8; 20]");
-    };
-
-    // build NETRID Packet
-    let Ok(message) = BasicMessage {
-        id_type: IdType::CaaAssigned,
-        ua_type: UaType::Rotorcraft,
-        uas_id,
-        ..Default::default()
-    }
-    .pack() else {
-        panic!("({identifier} could not pack BasicMessage");
-    };
-
-    let Ok(payload) = Frame {
-        header: Header {
-            message_type: MessageType::Basic,
-            ..Default::default()
-        },
-        message,
-    }
-    .pack() else {
-        panic!("({identifier} could not pack Frame");
-    };
-
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri(format!("{url}/netrid"))
-        .header("content-type", "application/octet-stream")
-        .header("Authorization", format!("Bearer {token}"))
-        .body(Body::from(payload.to_vec()))
-        .unwrap();
-
-    let result = client.request(req).await.map_err(|e| {
-        println!("({identifier}) could not issue id update: {}", e);
-        NetworkError::Other
-    })?;
-
-    if result.status() != StatusCode::OK {
-        println!(
-            "({identifier}) could not issue id update: {}",
-            result.status()
-        );
-        return Err(NetworkError::Unauthorized);
-    }
-
-    // println!("({identifier}) response {:#?}.", result);
-    // println!("({identifier}) issued id update.");
-    Ok(())
-}
-
-/// Issue position update to network
-async fn position_update(client: &Client<HttpConnector>, url: &str, token: &str, state: &State) -> Result<(), NetworkError> {
-    let altitude = LocationMessage::encode_altitude(state.position.altitude as f32);
-
-    let adjusted_track = if state.track_angle_deg < 0.0 {
-        state.track_angle_deg + 360.0
-    } else {
-        state.track_angle_deg
-    };
-
-    let Ok((ew_direction, track_direction)) = LocationMessage::encode_direction(adjusted_track as u16) else {
-        panic!("({}) could not encode direction", state.id);
-    };
-
-    let Ok((speed_multiplier, speed)) = LocationMessage::encode_speed(state.ground_velocity_m_s as f32) else {
-        panic!("({}) could not encode speed", state.id);
-    };
-
-    let vertical_speed = LocationMessage::encode_vertical_speed(state.vertical_velocity_m_s as f32);
-    let latitude = LocationMessage::encode_latitude(state.position.latitude);
-    let longitude = LocationMessage::encode_longitude(state.position.longitude);
-    let Ok(timestamp) = LocationMessage::encode_timestamp(chrono::Utc::now()) else {
-        panic!("({}) could not encode timestamp", state.id);
-    };
-
-    let Ok(message) = LocationMessage {
-        speed,
-        speed_multiplier,
-        speed_accuracy: SpeedAccuracyMetersPerSecond::Lt1,
-        ew_direction,
-        track_direction,
-        vertical_speed,
-        latitude,
-        longitude,
-        pressure_altitude: altitude.clone(),
-        geodetic_altitude: altitude.clone(),
-        height: altitude,
-        height_type: HeightType::AboveGroundLevel,
-        vertical_accuracy: VerticalAccuracyMeters::Lt1,
-        barometric_altitude_accuracy: VerticalAccuracyMeters::Lt1,
-        horizontal_accuracy: HorizontalAccuracyMeters::Lt1,
-        timestamp,
-        timestamp_accuracy: 0.into(),
-        operational_status: match state.activity {
-            Activity::Idle => OperationalStatus::Ground,
-            Activity::Cruise => OperationalStatus::Airborne,
-        },
-        reserved_0: 0.into(),
-        reserved_1: 0.into(),
-        reserved_2: 0,
-    }
-    .pack() else {
-        panic!("({}) could not pack LocationMessage", state.id);
-    };
-
-    let Ok(payload) = Frame {
-        header: Header {
-            message_type: MessageType::Location,
-            ..Default::default()
-        },
-        message,
-    }
-    .pack() else {
-        panic!("({}) could not pack location frame", state.id);
-    };
-
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri(format!("{url}/netrid"))
-        .header("content-type", "application/octet-stream")
-        .header("Authorization", format!("Bearer {token}"))
-        .body(Body::from(payload.to_vec()))
-        .unwrap();
-
-    let result = client.request(req).await.map_err(|e| {
-        println!("({}) could not issue position update: {}", state.id, e);
-        NetworkError::Other
-    })?;
-
-    if result.status() != StatusCode::OK {
-        println!(
-            "({}) could not issue position update: {}",
-            state.id,
-            result.status()
-        );
-        return Err(NetworkError::Unauthorized);
-    }
-
-    // println!("({}) response {:#?}.", state.id, result);
-    // println!("({}) issued position update.", state.id);
-    Ok(())
-}
-
-fn adjust_velocity(current_ms: &u64, state: &mut State) {
-    println!("| {} | {current_ms} | adjusting velocity.", state.id);
-    println!("| {} | {current_ms} | current location: {:?}", state.id, state.position);
-    let Some(ref plan) = state.current_plan else {
-        state.current_plan = None;
-        state.activity = Activity::Idle;
-        return;
-    };
-
-    let Some((ref next_point, tick)) = plan.path.get(0) else {
-        println!("| {} | {current_ms} | no more points in plan.", state.id);
-        state.current_plan = None;
-        state.activity = Activity::Idle;
-        return;
-    };
-
-    let time_to_next_point_s = (tick - *current_ms) as f64 / 1000.0;
-    println!("| {} | {} | next point: {:?} in {} s", state.id, current_ms, next_point, time_to_next_point_s);
-
-    let p1 = point!(x: state.position.longitude, y: state.position.latitude);
-    let p2 = point!(x: next_point.longitude, y: next_point.latitude);
-    state.ground_velocity_m_s = p1.haversine_distance(&p2) / time_to_next_point_s;
-    state.vertical_velocity_m_s = (next_point.altitude - state.position.altitude) / time_to_next_point_s;
-    state.track_angle_deg = p1.haversine_bearing(p2);
-
-    println!("| {} | {} | adjusted velocity; hor m/s: {}, vert m/s: {}, bearing (deg): {}", state.id, current_ms, state.ground_velocity_m_s, state.vertical_velocity_m_s, state.track_angle_deg);
-}
-
-fn update_location(current_tick: &u64, state: &mut State) {
-    let Some(ref mut plan) = state.current_plan else {
-        state.activity = Activity::Idle;
-        return;
-    };
-
-    // update state
-    let elapsed_s = (SLEEP_TIME_MS as f64) / 1000.0;
-    let vertical_travel_distance_m = state.vertical_velocity_m_s * elapsed_s;
-    let horizontal_travel_distance_m = state.ground_velocity_m_s * elapsed_s;
-    state.position.altitude += vertical_travel_distance_m;
-
-    let p1 = point!(x: state.position.longitude, y: state.position.latitude);
-    let p2 = p1.haversine_destination(state.track_angle_deg, horizontal_travel_distance_m);
-
-    state.position.longitude = p2.x();
-    state.position.latitude = p2.y();
-
-    let Some((ref next_point, _)) = plan.path.get(0) else {
-        state.current_plan = None;
-        state.activity = Activity::Idle;
-        return;
-    };
-
-    let p3 = point!(x: next_point.longitude, y: next_point.latitude);
-    if p2.haversine_distance(&p3) >= 5.0 {
-        return;
-    }
-
-    // Arrived at point
-    println!("| {} | {} | arrived at intermediate point.", state.id, current_tick);
-    plan.path.remove(0);
-
-    adjust_velocity(current_tick, state);
-}
-
 #[tokio::main]
 async fn main() {
-    let identifier = format!("AETH-{:>05}", rand::random::<u8>());
-
-    println!("({}) aircraft startup.", identifier);
 
     let args = Args::parse();
-    let url = format!("http://{}:{}", args.host, args.port);
+    let identifier = args.name;
+    println!("({}) aircraft startup.", identifier);
+
+    let scanner_id = args.scanner_id.replace('"', "");
+    let tlm_uri = format!("http://0.0.0.0:{}/telemetry", args.tlm_port);
+    let atc_uri = format!("http://0.0.0.0:{}/atc", args.atc_port);
+    let cargo_uri = format!("http://0.0.0.0:{}/cargo", args.cargo_port);
+
     let client: Client<HttpConnector> = Client::builder()
         .pool_idle_timeout(std::time::Duration::from_secs(10))
         .build_http();
-    let uri = format!("{url}/telemetry");
 
     let mut state = State {
-        id: identifier,
+        id: identifier.clone(),
+        scanner_id,
         current_plan: None,
         activity: Activity::Idle,
         token: None,
         position: PointZ {
-            longitude: 5.133053153910531,
-            latitude: 52.64237411858314,
-            altitude: 0.0,
+            longitude: args.longitude,
+            latitude: args.latitude,
+            altitude_meters: 0.0,
         },
         ground_velocity_m_s: 0.0,
         vertical_velocity_m_s: 0.0,
@@ -367,65 +112,45 @@ async fn main() {
         // operational: true,
     };
 
-    let mut plans: Vec<FlightPlan> = vec![
-        FlightPlan {
-            id: "1".to_string(),
-            path: vec![
-                (
-                    PointZ {
-                        longitude: 5.133053153910531,
-                        latitude: 52.64237411858314,
-                        altitude: 0.0,
-                    },
-                    chrono::Utc::now().timestamp_millis() as u64,
-                ),
-                (
-                    PointZ {
-                        longitude: 5.070817616006518,
-                        latitude: 52.615021990689414,
-                        altitude: 100.0,
-                    },
-                    (chrono::Utc::now() + chrono::Duration::seconds(60)).timestamp_millis() as u64,
-                ),
-                (
-                    PointZ {
-                        longitude: 5.014984013754936,
-                        latitude: 52.61957604802006,
-                        altitude: 0.0,
-                    },
-                    (chrono::Utc::now() + chrono::Duration::seconds(120)).timestamp_millis() as u64,
-                ),
-            ]
-        },
-    ];
-
+    let mut plans: Vec<FlightPlan> = vec![];
     let mut retry = 0;
     let max_retries = 5;
+    let retry_interval = tokio::time::Duration::from_secs(5);
+    let uuid = args.uuid;
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(SLEEP_TIME_MS));
-
+    let mut last_tick = chrono::Utc::now().timestamp_millis() as u64;
     loop {
         interval.tick().await;
         let current_tick = chrono::Utc::now().timestamp_millis() as u64;
-        update_location(&current_tick, &mut state);
+        update_location(&current_tick, &last_tick, &mut state);
+        adjust_vertical_velocity(&current_tick, &mut state);
+        last_tick = current_tick;
 
         // Check for new orders
         if state.current_plan.is_none() {
-            if let Some(fp) = plans.get(0) {
-                if let Some((_, tick)) = fp.path.get(0) {
-                    if *tick < current_tick {
-                        let plan = plans.remove(0);
-                        println!("| {} | {current_tick} | new flight plan: {}", state.id, plan.id);
-                        state.current_plan = Some(plan);
-                        adjust_velocity(&current_tick, &mut state);
-                    }
+            let mut activate = false;
+            if let Some(ref fp) = plans.first() {
+                if (fp.origin_timeslot_end.timestamp_millis() as u64) < current_tick {
+                    activate = true;
                 }
+            }
+
+            if activate {
+                let plan = plans.remove(0);
+                orders::init_plan(&client, &mut state, &cargo_uri, current_tick, plan).await;
+            }
+        }
+
+        if let Some(ref plan) = state.current_plan {
+            if plan.path.is_empty() {
+                orders::end_plan(&client, &mut state, &cargo_uri).await;
             }
         }
 
         // Acquire network token if not present
         let Some(ref token) = state.token else {
-            if let Ok(token) = acquire_token(&client, &uri, state.id.clone()).await {
+            if let Ok(token) = acquire_token(&client, &tlm_uri, state.id.clone()).await {
                 state.token = Some(token);
                 retry = 0;
 
@@ -439,14 +164,26 @@ async fn main() {
                     );
                 }
 
+                tokio::time::sleep(retry_interval).await;
                 continue;
             }
         };
 
         // Every 2000ms (0.5 Hz)
         if current_tick - state.last_id_update_ms > 2000 {
+            let (id_type, id) = match state.current_plan {
+                Some(ref p) => (IdType::SpecificSession, p.session_id.clone()),
+                None => (IdType::CaaAssigned, state.id.clone())
+            };
+
             // issue id update
-            let result = id_update(&client, &uri, &state.id, &token).await;
+            let result = id_update(
+                &client,
+                &tlm_uri,
+                id_type,
+                &id,
+                &token
+            ).await;
 
             match result {
                 Ok(_) => {
@@ -463,7 +200,7 @@ async fn main() {
         // Every 500ms (2 Hz)
         if current_tick - state.last_update_ms > 500 {
             // issue position and velocity update
-            let result = position_update(&client, &uri, &token, &state).await;
+            let result = position_update(&client, &tlm_uri, &token, &state).await;
 
             match result {
                 Ok(_) => {
@@ -472,6 +209,36 @@ async fn main() {
                 Err(e) => {
                     println!("({}) could not issue position update: {}", state.id, e);
                     state.token = None;
+                    continue;
+                }
+            }
+        }
+
+        // Every 15000ms
+        if current_tick - state.last_order_check > 15000 {
+            // issue position and velocity update
+            let result = get_orders(&client, &atc_uri, uuid.clone(), &identifier).await;
+            state.last_order_check = current_tick;
+
+            match result {
+                Ok(orders) => {
+                    for order in orders {
+                        let mut in_place = false;
+                        plans.iter_mut().for_each(|p| if p.session_id == order.session_id {
+                            *p = order.clone();
+                            in_place = true;
+                        });
+
+                        if !in_place {
+                            plans.push(order.clone());
+                        }
+
+                        // acknowledge order
+                        let _ = acknowledge_order(&client, &atc_uri, &order.flight_uuid, &identifier).await;
+                    }
+                }
+                Err(e) => {
+                    println!("({}) could not get orders: {}", state.id, e);
                     continue;
                 }
             }
