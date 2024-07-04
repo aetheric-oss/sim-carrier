@@ -36,7 +36,9 @@ check-logs-dir:
 	if [ ! -d "$(SOURCE_PATH)/logs" ]; then mkdir -p "$(SOURCE_PATH)/logs" ; fi
 
 setup:
-	mkdir -p .ccache .simulator-gazebo
+	mkdir -p .px4 .qgc .gazebo .runtime .ccache
+	chmod 0700 .runtime
+	docker build -t px4-local -f Dockerfile-px4 .
 
 build: check-cargo-registry
 	@$(call cargo_run,build)

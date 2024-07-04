@@ -1,88 +1,116 @@
-# Carrier Simulation
+# :dove: Carrier Simulation
 
-## Installation
+## :hammer: Installation
 
 ```bash
 # in another directory outside of this repo
-git clone https://github.com/PX4/PX4-Autopilot.git --recursive
-git clone https://github.com/mavlink/qgroundcontrol --recursive
+git clone -b v1.14.3 https://github.com/PX4/PX4-Autopilot.git --recursive
 
-# build qgroundcontrol
+# in another directory outside of this repo, build qgroundcontrol
+git clone -b StableV4.2 https://github.com/mavlink/qgroundcontrol --recursive
 cd qgroundcontrol
-docker build --file ./deploy/docker/Dockerfile-build-linux -t qgc-linux-docker .
+docker build --file ./deploy/docker/Dockerfile-build-ubuntu -t qgc-linux-docker .
 mkdir build .cache
 docker run --rm \
+    --user $(id -u):$(id -g) \
     -v ${PWD}:/project/source \
     -v ${PWD}/build:/project/build \
     -v ${PWD}/.cache:/.cache \
-    --user $(id -u):$(id -g) \
     qgc-linux-docker
 
+# in this directory
+make setup # generates a new .env file and required folders
+
 # edit local .env file to update PX4_AUTOPILOT_DIR=/path/to/PX4-Autopilot
+# NOTICE! Running px4 with docker compose in this repository will make changes
+#  to certain files in your PX4_AUTOPILOT_DIR. Please be aware of this and be on
+#  a clean branch or dedicated directory.
+
 # edit local .env file to update QGC_DIR=/path/to/qgroundcontrol
 
-# (optional) to use NVIDIA hardware
-# https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html#installing-with-apt
-# https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html#configuring-docker
+# Don't need to do this yet, commented out for the time being
+# docker build -t sim-carrier .
+# docker compose pull
 
-# in this directory
-# TODO Makefile target
-docker build -t sim-carrier .
-docker pull
-mkdir .px4 .qgc .gazebo # or else permissions issues
-
-USER_ID=$(id -u) GID=$(id -g) docker compose up px4
+USER_ID=$(id -u) GROUP_ID=$(id -g) docker compose up px4
 ```
 
-See [common installation errors](#common-installation-errors) in the appendix.
+To use NVIDIA hardware (optional):
+- [Install NVIDIA Dependencies](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html#installing-with-apt)
+- [Configure Docker to Use NVIDIA Driver](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html#configuring-docker)
 
-## Overview 
+## :telescope: Overview 
 
-Simulates an aircraft movement and answer/reply with the backend.
+### [`docker-compose.yaml`](docker-compose.yaml)
+
+The following services are launched with docker compose:
+- Gazebo
+    - Robot physics simulation.
+    - A rotorcraft model is loaded into a 3D world with simulated sensor data.
+- PX4 Autopilot (SITL)
+    - Drone flight software.
+    - Stabilization, GPS follow, precision landing, and more.
+    - Instead of in flight hardware, we will be running PX4 software-in-the-loop (SITL). 
+    - Will subscribe to the sensor messages from Gazebo and believe it's actually flying in real world environment.
+- QGroundControl
+    - Send MAVLINK messages to the aircraft (PX4 Autopilot).
+    - Define flight plans (waypoints, takeoff/landing coordinates, etc.) and upload them to aircraft.
+    - Pre-flight checklists, aircraft sensor calibration, arming/disarming aircraft.
+    - Joystick
+
+The connections are illustrated below:
 
 ```mermaid
+%%{
+  init: {
+    'theme': 'base',
+    'themeVariables': {
+      'primaryColor': '#5D3FD3',
+      'primaryTextColor': '#fff',
+      'primaryBorderColor': '#7C0000',
+      'lineColor': '#F8B229',
+      'secondaryColor': '#800020',
+      'tertiaryColor': '#fff'
+    }
+  }
+}%%
+flowchart TB
 
-sequenceDiagram
-    loop
-        alt if network token is None
-            sim->>an: {url}/telemetry/login
-            an->>sim: token
-            sim->>sim: continue
+    subgraph docker["&amp#128051 Docker"]
+        subgraph gazebo["Gazebo (Container)"]
+            gz-4560["4560/tcp"]
+            gz-display[":1"]
         end
 
-        alt if time to submit position
-            sim->>an: AircraftPosition
-            sim->>an: AircraftVelocity
+        subgraph px4["PX4 (Container)"]
+            px4-14550["14550/udp"]
         end
 
-        alt if time to submit id
-            sim->>an: AircraftId
+        subgraph qgc["QGroundControl (Container)"]
+            qgc-display[":1"]
+            qgc-14550["14550/udp"]
+            qgc-serial["/dev/tty"]
         end
-
-        sim->>sim: sleep 100ms
     end
 
+    display["Host Display"]
+    host-dev["Host /dev/tty"]
+
+    px4-14550 --[1]--> qgc-14550
+    qgc-14550 --[2]--> px4-14550
+    joy["Joystick"] <---> host-dev
+    host-dev <--[mount]--> qgc-serial
+    display <--- qgc-display
+    display <--- gz-display
 ```
 
-# Appendix
+#### Downsides of Dockerization
 
-## Common Installation Errors
+Typically QGroundControl, Gazebo, and PX4 Autopilot (SITL) are run together on the same host. In fact, the recommended way to run PX4 with Gazebo is a PX4 Makefile target which launches both together.
 
-### Build Git Version Header
+However, we decided to run PX4 in a separate container to eventually take advantage of the `deploy: replicas:` feature of docker compose. This will deploy multiple simulated aircraft while Gazebo is launched once in a separate container.
 
-This attempts to build a header file, in doing so it calls a couple of git commands.
+Since we have taken this path, these programs are no longer sharing a localhost. `docker compose up px4` will, during initialization, edit some files in the local PX4-Autopilot repository to replace hardcoded (or implied) references to 'localhost'. This will point PX4 to the proper static IP addresses[^staticip] for the Gazebo and QGC containers.
 
-The git command doesn't like being called in directories not owned by the caller, resulting in a 128 error.
+[^staticip]: Static IP addresses are used because the scripts in PX4-Autopilot will not expand hostnames.
 
-```bash
-FAILED: src/lib/version/build_git_version.h 
-sim-carrier-px4  | cd /src/PX4-Autopilot && /usr/bin/python3 /src/PX4-Autopilot/src/lib/version/px_update_git_header.py /src/PX4-Autopilot/build/px4_sitl_default/src/lib/version/build_git_version.h --validate
-sim-carrier-px4  | Traceback (most recent call last):
-sim-carrier-px4  |   File "/src/PX4-Autopilot/src/lib/version/px_update_git_header.py", line 124, in <module>
-sim-carrier-px4  |     mavlink_git_version = subprocess.check_output('git rev-parse --verify HEAD'.split(),
-sim-carrier-px4  |   File "/usr/lib/python3.8/subprocess.py", line 415, in check_output
-sim-carrier-px4  |     return run(*popenargs, stdout=PIPE, timeout=timeout, check=True,
-sim-carrier-px4  |   File "/usr/lib/python3.8/subprocess.py", line 516, in run
-sim-carrier-px4  |     raise CalledProcessError(retcode, process.args,
-sim-carrier-px4  | subprocess.CalledProcessError: Command '['git', 'rev-parse', '--verify', 'HEAD']' returned non-zero exit status 128.
-```
