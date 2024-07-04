@@ -1,122 +1,53 @@
 use clap::Parser;
-use hyper::{
-    client::connect::HttpConnector,
-    client::Client,
-};
-use svc_telemetry_client_rest::netrid_types::*;
-use svc_atc_client_rest::types::{PointZ, Cargo, FlightPlan as AtcFlightPlan};
-use lib_common::time::{DateTime, Utc};
-use std::collections::{BinaryHeap, VecDeque};
+use svc_atc_client_rest::types::{Pose, Cargo, Phase, FlightPlan as AtcFlightPlan};
+use lib_common::time::{ Utc, DateTime};
+use std::sync::{Arc, Mutex};
+use mavlink::common::MissionState;
 
-mod orders;
-mod parcel;
+// mod orders;
+// mod parcel;
+mod proxy;
 mod telemetry;
+mod provision;
 mod config;
 
-use telemetry::*;
-use orders::*;
+// use orders::*;
+const AIRCRAFT_PREFIX: &str = "AETH-PX4-SIM";
 
-const MAX_RETRIES: u8 = 5;
-const RETRY_SLEEP_S: u64 = 5;
-
-/// Simple program to greet a person
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// aircraft name
-    #[arg(long)]
-    name: String,
+    /// PX4 instance number
+    #[arg(long, short, default_value_t = 0)]
+    px4: u32,
 
-    /// aircraft uuid
-    #[arg(long)]
-    uuid: String,
-
-    /// starting longitude
-    #[arg(long)]
-    longitude: f64,
-
-    /// starting latitude
-    #[arg(long)]
-    latitude: f64,
-
-    /// scanner id
-    #[arg(long)]
-    scanner_id: String
 }
 
-const SLEEP_TIME_MS: u64 = 50;
-
-#[derive(Debug, Clone)]
+// #[derive(Debug, Clone)]
 struct FlightPlan {
     flight_uuid: String,
     session_id: String,
     origin_timeslot_start: DateTime<Utc>,
     origin_timeslot_end: DateTime<Utc>,
     target_timeslot_start: DateTime<Utc>,
-    // target_timeslot_end: DateTime<Utc>,
-    acquire: Vec<Cargo>,
-    deliver: Vec<Cargo>,
-    path: VecDeque<PointZ>,
+    target_timeslot_end: DateTime<Utc>,
+    // acquire: Vec<Cargo>,
+    // deliver: Vec<Cargo>,
+    phases: Vec<Phase>,
 }
 
 impl From<AtcFlightPlan> for FlightPlan {
     fn from(value: AtcFlightPlan) -> Self {
-        let mut path = VecDeque::new();
-        for point in value.path {
-            path.push_back(PointZ {
-                longitude: point.longitude,
-                latitude: point.latitude,
-                altitude_meters: point.altitude_meters,
-            });
-        }
-
         FlightPlan {
             flight_uuid: value.flight_uuid,
             session_id: value.session_id,
             origin_timeslot_start: value.origin_timeslot_start,
             origin_timeslot_end: value.origin_timeslot_end,
             target_timeslot_start: value.target_timeslot_start,
-            // target_timeslot_end: value.target_timeslot_end,
-            acquire: value.acquire,
-            deliver: value.deliver,
-            path
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct State {
-    current_plan: Option<FlightPlan>,
-    id: String,
-    scanner_id: String,
-    token: Option<String>,
-    position: PointZ,
-    ground_velocity_m_s: f64,
-    vertical_velocity_m_s: f64,
-    track_angle_deg: f64,
-    last_update_ms: u64,
-    last_id_update_ms: u64,
-    last_order_check: u64,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        State {
-            current_plan: None,
-            id: String::new(),
-            scanner_id: String::new(),
-            token: None,
-            position: PointZ {
-                longitude: 0.0,
-                latitude: 0.0,
-                altitude_meters: 0.0,
-            },
-            ground_velocity_m_s: 0.0,
-            vertical_velocity_m_s: 0.0,
-            track_angle_deg: 0.0,
-            last_update_ms: 0,
-            last_id_update_ms: 0,
-            last_order_check: 0,
+            target_timeslot_end: value.target_timeslot_end,
+            // acquire: value.acquire,
+            // deliver: value.deliver,
+            phases: value.phases
         }
     }
 }
@@ -142,162 +73,158 @@ impl PartialEq for FlightPlan {
 
 impl Eq for FlightPlan {}
 
+#[derive(Debug)]
+struct State {
+    session_id: String,
+    aircraft_id: String,
+    hangar_id: String,
+    hangar_bay_id: String,
+    scanner_id: String,
+    mission_state: MissionState,
+}
+
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), ()> {
     let config = config::Config::try_from_env()
-        .map_err(|e| format!("could not load config: {}", e))?;
+        .map_err(|e| {
+            format!("could not load config: {}", e);
+        })?;
 
     let args = Args::parse();
+    let base_url = config.realm_host;
+    let tlm_uri = format!("http://{base_url}:{}/telemetry", config.telemetry_host_port_rest);
+    let itest_uri = format!("http://{base_url}:{}/demo", config.itest_host_port_rest);
 
-    let identifier = args.name;
-    let uuid = args.uuid;
-    let scanner_id = args.scanner_id;
-    let base_url = config.host;
-    let tlm_uri = format!("{base_url}:{}/telemetry", config.telemetry_host_port_rest);
-    let atc_uri = format!("{base_url}:{}/atc", config.atc_host_port_rest);
-    let cargo_uri = format!("{base_url}:{}/cargo", config.cargo_host_port_rest);
-    
-    println!("({}) aircraft startup.", identifier);
+    // let atc_uri = format!("{base_url}:{}/atc", config.atc_host_port_rest);
+    // let cargo_uri = format!("{base_url}:{}/cargo", config.cargo_host_port_rest);
+    // println!("({}) aircraft startup.", identifier);
+    let identifier = format!("{}-{}", AIRCRAFT_PREFIX, args.px4);
 
-    let mut state = State {
-        id: identifier.clone(),
-        scanner_id,
-        position: PointZ {
-            longitude: args.longitude,
-            latitude: args.latitude,
-            altitude_meters: 0.0,
-        },
-        ..Default::default()
-    };
+    //
+    // Spawn mavlink passthrough for this px4 instance
+    // Each instance will broadcast to a unique port, starting from the base port 14550
+    let state_mtx = Arc::new(Mutex::new(State {
+        session_id: identifier.clone(),
+        aircraft_id: String::new(),
+        hangar_id: String::new(),
+        hangar_bay_id: String::new(),
+        scanner_id: String::new(),
+        mission_state: MissionState::MISSION_STATE_UNKNOWN,
+    }));
 
-    let mut plans: BinaryHeap<FlightPlan> = BinaryHeap::new();
-    let mut old_sessions: VecDeque<String> = VecDeque::new();
-    let mut retry: u8 = 0;
+    //
+    // Data needed for the proxy
+    let (tx, mut cmd_rx) = std::sync::mpsc::channel();
+    let proxy_udp_address = format!("127.0.0.1:{}", config.udp_port as u32 + args.px4);
+    let proxy_tlm_uri = tlm_uri.clone();
+    let proxy_itest_uri = itest_uri.clone();
+    let proxy_state_mtx = Arc::clone(&state_mtx);
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy::mavlink_proxy(
+            proxy_udp_address,
+            proxy_tlm_uri,
+            proxy_itest_uri,
+            proxy_state_mtx,
+            args.px4,
+            cmd_rx
+        ).await;
+    });
 
-    let client: Client<HttpConnector> = Client::builder()
-        .pool_idle_timeout(std::time::Duration::from_secs(10))
-        .build_http();
-
+    // Orders loop
+    const SLEEP_TIME_MS: u64 = 1000;
     let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(SLEEP_TIME_MS));
     let mut last_tick = Utc::now().timestamp_millis() as u64;
+
     loop {
         interval.tick().await;
         let current_tick = Utc::now().timestamp_millis() as u64;
-        update_location(&current_tick, &last_tick, &mut state);
         last_tick = current_tick;
 
-        // Check for new orders
-        let _ = flight_plan_update(&client, &cargo_uri, &current_tick, &mut state, &mut plans).await;
+        // if proxy_handle.is_finished() {
+        //     println!("| {} | mavlink proxy exited, shutting down.", identifier);
+        //     break;
+        // }
 
-        if let Some(ref plan) = state.current_plan {
-            if plan.path.is_empty() {
-                old_sessions.push_back(plan.session_id.clone());
-                orders::end_plan(&client, &mut state, &cargo_uri).await;
+        println!("| {} | tick: {}", identifier, current_tick);
 
-                while old_sessions.len() > 10 {
-                    old_sessions.pop_front();
-                }
-            }
-        }
-
-        // Acquire network token if not present
-        let Some(ref token) = state.token else {
-            if let Ok(token) = acquire_token(&client, &tlm_uri, state.id.clone()).await {
-                state.token = Some(token);
-                retry = 0;
+        {
+            let Ok(mut state) = state_mtx.lock() else {
+                println!("could not lock mission state mutex");
                 continue;
-            } else {
-                retry += 1;
-                if retry > MAX_RETRIES {
-                    panic!(
-                        "({}) could not acquire token, expeded all retries.",
-                        state.id
-                    );
-                }
-
-                tokio::time::sleep(tokio::time::Duration::from_secs(RETRY_SLEEP_S)).await;
-                continue;
-            }
-        };
-
-        // Every 2000ms (0.5 Hz)
-        if current_tick - state.last_id_update_ms > 2000 {
-            let (id_type, id) = match state.current_plan {
-                Some(ref p) => (IdType::SpecificSession, p.session_id.clone()),
-                None => (IdType::CaaAssigned, state.id.clone())
             };
 
-            // issue id update
-            let result = id_update(
-                &client,
-                &tlm_uri,
-                id_type,
-                &id,
-                &token
-            ).await;
+            match state.mission_state {
+                MissionState::MISSION_STATE_ACTIVE => {
 
-            match result {
-                Ok(_) => {
-                    state.last_id_update_ms = current_tick;
-                }
-                Err(e) => {
-                    println!("({}) could not issue id update: {}", state.id, e);
-                    state.token = None;
-                    continue;
-                }
+                },
+                MissionState::MISSION_STATE_NO_MISSION => {
+                    if let Some(ref next) = plans.front() {
+                        // check if time to start
+                        if next.origin_timeslot_start.timestamp_millis() as u64 < current_tick {
+                            let _ = orders::init_plan(&client, &mut state, &cargo_uri, &current_tick, plan).await;
+                        }
+                    };
+                },
+                MissionState::MISSION_STATE_COMPLETE => {
+                    let _ = plans.pop_front();
+                    (*state).mission_state = MissionState::MISSION_STATE_NO_MISSION;
+                },
+                MissionState::MISSION_STATE_PAUSED | MissionState::MISSION_NOT_STARTED => {
+                    // TODO home? automatic?
+                },
             }
         }
 
-        // Every 500ms (2 Hz)
-        if current_tick - state.last_update_ms > 500 {
-            // issue position and velocity update
-            let result = position_update(&client, &tlm_uri, &token, &state).await;
+        // if let Some(ref plan) = state.current_plan {
+            // if plan.path.is_empty() {
+            //     old_sessions.push_back(plan.session_id.clone());
+            //     orders::end_plan(&client, &mut state, &cargo_uri).await;
 
-            match result {
-                Ok(_) => {
-                    state.last_update_ms = current_tick;
-                }
-                Err(e) => {
-                    println!("({}) could not issue position update: {}", state.id, e);
-                    state.token = None;
-                    continue;
-                }
-            }
-        }
+            //     while old_sessions.len() > 10 {
+            //         old_sessions.pop_front();
+            //     }
+            // }
+        // }
 
         // Every 15000ms
-        if current_tick - state.last_order_check > 15000 {
-            // issue position and velocity update
-            let result = get_orders(&client, &atc_uri, uuid.clone(), &identifier).await;
-            state.last_order_check = current_tick;
+        // Get Orders
+        // if (current_tick - state.last_order_check) > config.interval_order_check_ms {
+        //     // get orders
+        //     state.last_order_check = current_tick;
 
-            let Ok(orders) = result else {
-                println!("| ({}) | could not get orders.", state.id);
-                continue;
-            };
+        //     let result = get_orders(&client, &atc_uri, uuid.clone(), &identifier).await;
+        //     let Ok(orders) = result else {
+        //         println!("| ({}) | could not get orders.", state.id);
+        //         continue;
+        //     };
             
-            for order in orders {
-                if let Some(ref plan) = state.current_plan {
-                    if plan.session_id == order.session_id {
-                        continue;
-                    }
-                }
+        //     for order in orders {
+        //         if let Some(ref plan) = state.current_plan {
+        //             if plan.session_id == order.session_id {
+        //                 continue;
+        //             }
+        //         }
 
-                if old_sessions.contains(&order.session_id) {
-                    continue;
-                }
+        //         if old_sessions.contains(&order.session_id) {
+        //             continue;
+        //         }
 
-                if plans.iter().find(|p| p.session_id == order.session_id).is_none() {
-                    plans.push(order.clone())
-                }
+        //         if plans.iter().find(|p| p.session_id == order.session_id).is_none() {
+        //             plans.push(order.clone())
+        //         }
 
-                let _ = orders::acknowledge_order(&client, &atc_uri, &order.flight_uuid, &identifier).await;
-            }
+        //         let _ = orders::acknowledge_order(&client, &atc_uri, &order.flight_uuid, &identifier).await;
+        //     }
 
-            if let Some(ref plan) = plans.peek() {
-                let next_flight_s = (plan.origin_timeslot_end.timestamp_millis() as u64 - current_tick) / 1000;
-                println!("| {} | next flight time: {} (T-{} s)", state.id, plan.origin_timeslot_end, next_flight_s);
-            }
-        }
+        //     if let Some(ref plan) = plans.peek() {
+        //         let next_flight_s = (plan.origin_timeslot_end.timestamp_millis() as u64 - current_tick) / 1000;
+        //         println!("| {} | next flight time: {} (T-{} s)", state.id, plan.origin_timeslot_end, next_flight_s);
+        //     }
+        // }
     }
+
+    proxy_handle.abort();
+
+    Ok(())
 }

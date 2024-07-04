@@ -24,6 +24,8 @@ cargo_run = docker run \
 	$(ADDITIONAL_OPT) \
 	-v "$(SOURCE_PATH)/:/usr/src/app" \
 	-v "$(SOURCE_PATH)/.cargo/registry:/usr/local/cargo/registry" \
+	-v "$(SOURCE_PATH)/../rust-mavlink:/usr/src/rust-mavlink" \
+	-v "$(SOURCE_PATH)/../svc-itest:/usr/src/svc-itest" \
 	-e CARGO_INCREMENTAL=$(CARGO_INCREMENTAL) \
 	-e RUSTC_BOOTSTRAP=$(RUSTC_BOOTSTRAP) \
 	-t $(RUST_IMAGE_NAME):$(RUST_IMAGE_TAG) \
@@ -36,17 +38,19 @@ check-logs-dir:
 	if [ ! -d "$(SOURCE_PATH)/logs" ]; then mkdir -p "$(SOURCE_PATH)/logs" ; fi
 
 setup:
-	mkdir -p .ccache .simulator-gazebo
+	mkdir -p .px4 .qgc .gazebo .runtime .ccache
+	chmod 0700 .runtime
+	docker build -t px4-local -f Dockerfile-px4 .
 
-build: check-cargo-registry
+rust-build: check-cargo-registry
 	@$(call cargo_run,build)
 
-release: check-cargo-registry
+rust-release: check-cargo-registry
 	@$(call cargo_run,build --release --target $(RELEASE_TARGET))
 
-test: check-cargo-registry
+rust-test: check-cargo-registry
 	@$(call cargo_run,test)
 
-clean: check-cargo-registry
+rust-clean: check-cargo-registry
 	rm -rf .ccache .simulator-gazebo
 	@$(call cargo_run,clean)

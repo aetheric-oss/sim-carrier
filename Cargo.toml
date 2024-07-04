@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "1.0.82"
+anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 config = "0.14"
 dotenv = "0.15"
@@ -19,16 +19,37 @@ rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.36", features = ["full"] }
+# mavlink = { version = "0.13", features = ["common"] }
+async-trait = "0.1.81"
+num = "0.4.3"
+num-traits = "0.2.19"
+num-derive = "0.4.2"
+
+[dependencies.mavlink]
+# path="../rust-mavlink/mavlink"
+git = "https://github.com/mavlink/rust-mavlink.git"
+tag = "0.12.2"
+features=["emit-extensions"]
 
 [dependencies.svc-telemetry-client-rest]
 git = "https://github.com/aetheric-oss/svc-telemetry.git"
-tag = "latest-develop"
+# tag = "latest-develop"
+branch = "am-smith/dw-1536/improve-unit-test-covera"
 
 [dependencies.svc-atc-client-rest]
 git = "https://github.com/aetheric-oss/svc-atc.git"
-tag = "latest-develop"
-# branch = "am-smith/dw-1163/deliver-and-receive-orders"
+# tag = "latest-develop"
+branch = "am-smith/sim-changes"
 
 [dependencies.svc-cargo-client-rest]
 git = "https://github.com/aetheric-oss/svc-cargo.git"
+tag = "latest-develop"
+
+[dependencies.svc-itest-client-rest]
+# git = "https://github.com/aetheric-oss/svc-cargo.git"
+# tag = "latest-develop"
+path = "../svc-itest/client-rest"
+
+[dependencies.lib-common]
+git = "https://github.com/aetheric-oss/lib-common.git"
 tag = "latest-develop"

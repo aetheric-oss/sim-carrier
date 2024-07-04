@@ -10,10 +10,13 @@ use serde::Deserialize;
 /// struct holding configuration options
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
-    pub host: String,
+    pub udp_port: u16,
+    pub realm_host: String,
     pub cargo_host_port_rest: u16,
     pub atc_host_port_rest: u16,
-    pub telemetry_host_port_rest: u16
+    pub telemetry_host_port_rest: u16,
+    pub itest_host_port_rest: u16,
+    pub interval_order_check_ms: u64
 }
 
 impl Config {

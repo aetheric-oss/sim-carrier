@@ -1,25 +1,39 @@
 use hyper::{
     body::{Body, Bytes},
-    client::connect::HttpConnector,
-    client::Client,
+    client::{ connect::HttpConnector, Client },
     Method, Request, StatusCode,
 };
 use packed_struct::PackedStruct;
-use svc_atc_client_rest::types::PointZ;
-use svc_telemetry_client_rest::netrid_types::*;
-use geo::prelude::*;
-use geo::point;
+use svc_telemetry_client_rest::netrid_types::{
+    *, location::DecodedLocationRid, location::EncodedLocationRid,
+    basic::DecodedBasicRid, basic::EncodedBasicRid,
+};
+// use geo::prelude::*;
+// use geo::point;
 use lib_common::time::Utc;
-use crate::State;
+// use num_derive::FromPrimitive;
+use num_traits::FromPrimitive;
 
 pub enum NetworkError {
     Unauthorized,
+    StateLock,
+    TokenLock,
+    DirectionEncode,
+    SpeedEncode,
+    TimestampEncode,
     Other,
 }
+
+pub type NetridPacket = [u8; 25];
 
 impl std::fmt::Display for NetworkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            NetworkError::StateLock => write!(f, "Could not get state lock"),
+            NetworkError::TokenLock => write!(f, "Could not get token lock"),
+            NetworkError::DirectionEncode => write!(f, "Could not encode direction"),
+            NetworkError::SpeedEncode => write!(f, "Could not encode speed"),
+            NetworkError::TimestampEncode => write!(f, "Could not encode timestamp"),
             NetworkError::Unauthorized => write!(f, "Unauthorized"),
             NetworkError::Other => write!(f, "Other"),
         }
@@ -29,7 +43,7 @@ impl std::fmt::Display for NetworkError {
 pub(crate) async fn acquire_token(
     client: &Client<HttpConnector>,
     base_url: &str,
-    identifier: String,
+    identifier: &String,
 ) -> Result<String, NetworkError> {
     let url = format!("{base_url}/login");
 
@@ -72,36 +86,39 @@ pub(crate) async fn acquire_token(
 pub(crate) async fn id_update(
     client: &Client<HttpConnector>,
     url: &str,
-    id_type: IdType,
     uas_id: &str,
     token: &str,
 ) -> Result<(), NetworkError> {
     // issue id update
-    let Ok(uas_id_formatted) = <[u8; 20]>::try_from(format!("{:>20}", uas_id).as_ref()) else {
-        panic!("({uas_id} could not convert identifier to [u8; 20]");
-    };
-
     // build NETRID Packet
-    let Ok(message) = BasicMessage {
+    let message = DecodedBasicRid {
         ua_type: UaType::Rotorcraft,
-        id_type,
-        uas_id: uas_id_formatted,
-        ..Default::default()
-    }
-    .pack() else {
-        panic!("({uas_id} could not pack BasicMessage");
+        id_type: IdType::CaaAssigned,
+        uas_id: uas_id.to_string(),
     };
 
-    let Ok(payload) = Frame {
+    let encoded = EncodedBasicRid::try_from(message).map_err(|_| {
+        // println!("({uas_id}) could not encode BasicMessage: {}", e);
+        NetworkError::Other
+    })?;
+
+    let message = encoded.pack().map_err(|_| {
+        // println!("({uas_id}) could not pack BasicMessage: {}", e);
+        NetworkError::Other
+    })?;
+
+    let frame = Frame {
         header: Header {
             message_type: MessageType::Basic,
             ..Default::default()
         },
         message,
-    }
-    .pack() else {
-        panic!("({uas_id} could not pack Frame");
     };
+
+    let payload = frame.pack().map_err(|_| {
+        // println!("({uas_id}) could not pack Frame: {}", e);
+        NetworkError::Other
+    })?;
 
     let req = Request::builder()
         .method(Method::POST)
@@ -111,16 +128,16 @@ pub(crate) async fn id_update(
         .body(Body::from(payload.to_vec()))
         .unwrap();
 
-    let result = client.request(req).await.map_err(|e| {
-        println!("({uas_id}) could not issue id update: {}", e);
+    let result = client.request(req).await.map_err(|_| {
+        // println!("({uas_id}) could not issue id update: {}", e);
         NetworkError::Other
     })?;
 
     if result.status() != StatusCode::OK {
-        println!(
-            "({uas_id}) could not issue id update: {}",
-            result.status()
-        );
+        // println!(
+        //     // "({uas_id}) could not issue id update: {}",
+        //     result.status()
+        // );
         return Err(NetworkError::Unauthorized);
     }
 
@@ -129,68 +146,68 @@ pub(crate) async fn id_update(
     Ok(())
 }
 
-/// Issue position update to network
-pub(crate) async fn position_update(client: &Client<HttpConnector>, url: &str, token: &str, state: &State) -> Result<(), NetworkError> {
-    let altitude = LocationMessage::encode_altitude(state.position.altitude_meters as f32);
+/// Process Open Drone ID Location Data
+pub fn process_open_drone_id_location_data(
+    _sequence: u8,
+    data: mavlink::common::OPEN_DRONE_ID_LOCATION_DATA
+) -> Result<DecodedLocationRid, NetworkError> {
+    let operational_status: OperationalStatus = FromPrimitive::from_u8(data.status as u8).unwrap_or(OperationalStatus::Undeclared);
+    let height_type: HeightType = FromPrimitive::from_u8(data.height_reference as u8).unwrap_or(HeightType::AboveTakeoff);
+    let horizontal_accuracy: HorizontalAccuracyMeters = FromPrimitive::from_u8(data.horizontal_accuracy as u8).unwrap_or(HorizontalAccuracyMeters::Gte18520);
+    let vertical_accuracy: VerticalAccuracyMeters = FromPrimitive::from_u8(data.vertical_accuracy as u8).unwrap_or(VerticalAccuracyMeters::Gte150Unknown);
+    let speed_accuracy: SpeedAccuracyMetersPerSecond = FromPrimitive::from_u8(data.speed_accuracy as u8).unwrap_or(SpeedAccuracyMetersPerSecond::Gte10Unknown);
+    let barometric_altitude_accuracy: VerticalAccuracyMeters = FromPrimitive::from_u8(data.barometer_accuracy as u8).unwrap_or(VerticalAccuracyMeters::Gte150Unknown);
+    let timestamp = Utc::now(); // PX4 sim doesn't set this field in the data
+        // .with_minute(data.timestamp / 60)
+        // .with_second(data.timestamp % 60) // from seconds after the hour to actual time
 
-    let Ok((ew_direction, track_direction)) = LocationMessage::encode_direction(state.track_angle_deg as u16) else {
-        panic!("({}) could not encode direction", state.id);
-    };
-
-    // println!("| {} | ew_direction: {:?}, track_direction: {}", state.id, ew_direction, track_direction);
-
-    let Ok((speed_multiplier, speed)) = LocationMessage::encode_speed(state.ground_velocity_m_s as f32) else {
-        panic!("({}) could not encode speed", state.id);
-    };
-
-    let vertical_speed = LocationMessage::encode_vertical_speed(state.vertical_velocity_m_s as f32);
-    let latitude = LocationMessage::encode_latitude(state.position.latitude);
-    let longitude = LocationMessage::encode_longitude(state.position.longitude);
-    let timestamp = LocationMessage::encode_timestamp(Utc::now())
-        .map_err(|e| {
-            panic!("({}) could not encode timestamp: {:?}", state.id, e);
-        })?;
-
-    let Ok(message) = LocationMessage {
-        speed,
-        speed_multiplier,
-        speed_accuracy: SpeedAccuracyMetersPerSecond::Lt1,
-        ew_direction,
-        track_direction,
-        vertical_speed,
-        latitude,
-        longitude,
-        pressure_altitude: altitude.clone(),
-        geodetic_altitude: altitude.clone(),
-        height: altitude,
-        height_type: HeightType::AboveGroundLevel,
-        vertical_accuracy: VerticalAccuracyMeters::Lt1,
-        barometric_altitude_accuracy: VerticalAccuracyMeters::Lt1,
-        horizontal_accuracy: HorizontalAccuracyMeters::Lt1,
+    let decoded_location = DecodedLocationRid {
+        operational_status,
+        height_type,
+        horizontal_accuracy,
+        vertical_accuracy,
+        speed_accuracy,
+        barometric_altitude_accuracy,
+        track_direction: data.direction / 100, // centidegrees to degrees
+        speed_mps: data.speed_horizontal as f32 / 100., // cm/s to m/s
+        vertical_speed_mps: data.speed_vertical as f32 / 100., // cm/s to m/s
+        latitude: data.latitude as f64 * 1e-7,
+        longitude: data.longitude as f64 * 1e-7,
+        pressure_altitude_meters: data.altitude_barometric,
+        geodetic_altitude_meters: data.altitude_geodetic,
+        height_meters: data.height,
         timestamp,
-        timestamp_accuracy: 0.into(),
-        operational_status: match state.ground_velocity_m_s > 0.0 {
-            false => OperationalStatus::Ground,
-            true => OperationalStatus::Airborne,
-        },
-        reserved_0: 0.into(),
-        reserved_1: 0.into(),
-        reserved_2: 0,
-    }
-    .pack() else {
-        panic!("({}) could not pack LocationMessage", state.id);
+        timestamp_accuracy: (data.timestamp_accuracy as u8) as f32 / 10.
     };
 
-    let Ok(payload) = Frame {
+    Ok(decoded_location)
+}
+
+/// Issue position update to network
+pub(crate) async fn location_update(
+    client: &Client<HttpConnector>,
+    url: &str,
+    token: &String,
+    decoded_location: DecodedLocationRid
+) -> Result<(), NetworkError> {
+    let encoded_location = EncodedLocationRid::try_from(decoded_location).map_err(|e| {
+        println!("could not encode location: {:?}", e);
+        NetworkError::Other
+    })?;
+
+    let payload = Frame {
         header: Header {
             message_type: MessageType::Location,
             ..Default::default()
         },
-        message,
-    }
-    .pack() else {
-        panic!("({}) could not pack location frame", state.id);
-    };
+        message: encoded_location.pack().map_err(|e| {
+            println!("could not pack location frame: {}", e);
+            NetworkError::Other
+        })?
+    }.pack().map_err(|e| {
+        println!("could not pack location frame: {}", e);
+        NetworkError::Other
+    })?;
 
     let req = Request::builder()
         .method(Method::POST)
@@ -200,17 +217,18 @@ pub(crate) async fn position_update(client: &Client<HttpConnector>, url: &str, t
         .body(Body::from(payload.to_vec()))
         .unwrap();
 
-    let result = client.request(req).await.map_err(|e| {
-        println!("({}) could not issue position update: {}", state.id, e);
+    let result = client.request(req).await.map_err(|_| {
+        // println!("({}) could not issue position update: {}", state.id, e);
         NetworkError::Other
     })?;
 
     if result.status() != StatusCode::OK {
-        println!(
-            "({}) could not issue position update: {}",
-            state.id,
-            result.status()
-        );
+        // println!(
+        //     "({}) could not issue position update: {}",
+        //     state.id,
+        //     result.status()
+        // );
+
         return Err(NetworkError::Unauthorized);
     }
 
@@ -219,123 +237,10 @@ pub(crate) async fn position_update(client: &Client<HttpConnector>, url: &str, t
     Ok(())
 }
 
-pub(crate) fn update_location(current_ms: &u64, last_ms: &u64, state: &mut State) {
-    let Some(ref mut plan) = state.current_plan else {
-        return;
-    };
-
-    // update state
-    let elapsed_s = ((current_ms - last_ms) as f64) / 1000.0;
-    let vertical_travel_distance_m = state.vertical_velocity_m_s * elapsed_s;
-    let horizontal_travel_distance_m = state.ground_velocity_m_s * elapsed_s;
-    state.position.altitude_meters += vertical_travel_distance_m;
-
-    let p1 = point!(x: state.position.longitude, y: state.position.latitude);
-    let p2 = p1.haversine_destination(state.track_angle_deg, horizontal_travel_distance_m);
-
-    state.position.longitude = p2.x();
-    state.position.latitude = p2.y();
-    state.track_angle_deg = p1.haversine_bearing(p2);
-    if state.track_angle_deg < 0.0 {
-        state.track_angle_deg += 360.0;
-    }
-
-    let Some(ref next_point) = plan.path.get(0) else {
-        println!("| {} | {current_ms} | no more points in plan.", state.id);
-        return;
-    };
-
-    let p3 = point!(x: next_point.longitude, y: next_point.latitude);
-    let mut new_track_angle = p2.haversine_bearing(p3);
-    if new_track_angle < 0.0 {
-        new_track_angle += 360.0;
-    }
-
-    let flip: bool = (new_track_angle - state.track_angle_deg).abs() > 90.; // massive degree change; target behind
-
-    // println!("| {} | {} | longitude: {}, latitude: {}, altitude: {}", state.id, current_ms, state.position.longitude, state.position.latitude, state.position.altitude_meters);
-    if !flip {
-        return;
-    }
-
-    // Arrived at point
-    println!("| {} | {} | arrived at intermediate point.", state.id, current_ms);
-    state.position = PointZ {
-        longitude: next_point.longitude,
-        latitude: next_point.latitude,
-        altitude_meters: next_point.altitude_meters,
-    };
-
-    plan.path.pop_front();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use svc_atc_client_rest::types::*;
 
     const METERS_PER_DEGREE_LATITUDE: f64 = 111_320.;
-
-    #[tokio::test]
-    async fn test_update_location() {
-        let mut state = State {
-            current_plan: None,
-            id: Uuid::new_v4().to_string(),
-            scanner_id: Uuid::new_v4().to_string(),
-            token: None,
-            position: PointZ {
-                longitude: 5.167,
-                latitude: 52.64,
-                altitude_meters: 10.0,
-            },
-            ground_velocity_m_s: 5.0,
-            vertical_velocity_m_s: 5.0,
-            track_angle_deg: 0.0,
-            last_update_ms: 0,
-            last_id_update_ms: 0,
-            last_order_check: 0,
-        };
-
-        state.current_plan = Some(FlightPlan {
-            path: vec![
-                PointZ {
-                    longitude: state.position.longitude,
-                    latitude: state.position.latitude + 0.01,
-                    altitude_meters: 20.0,
-                },
-            ],
-            origin_timeslot_end: Utc::now(),
-            origin_timeslot_start: Utc::now(),
-            target_timeslot_end: Utc::now(),
-            target_timeslot_start: Utc::now(),
-            aircraft_id: state.id.clone(),
-            flight_uuid: Uuid::new_v4().to_string(),
-            session_id: "AETH1234".to_string(),
-            origin_vertiport_id: Uuid::new_v4().to_string(),
-            target_vertiport_id: Uuid::new_v4().to_string(),
-            origin_vertipad_id: Uuid::new_v4().to_string(),
-            target_vertipad_id: Uuid::new_v4().to_string(),
-            acquire: vec![],
-            deliver: vec![]
-        });
-
-        let current_ms: u64 = Utc::now().timestamp_millis() as u64;
-        let original = state.clone();
-        update_location(&current_ms, &current_ms, &mut state);
-        assert!(state.position.latitude - original.position.latitude < 0.00000001);
-        assert!(state.position.longitude - original.position.longitude < 0.00000001);
-
-        let duration_s: f64 = 10.;
-        let estimated_latitude_delta = (duration_s * state.ground_velocity_m_s) / METERS_PER_DEGREE_LATITUDE;
-        let estimated_latitude_delta_ceil = ((duration_s + 0.1) * state.ground_velocity_m_s) / METERS_PER_DEGREE_LATITUDE;
-
-        let new_ms = current_ms + (duration_s * 1000.0) as u64;
-        update_location(&new_ms, &current_ms, &mut state);
-
-        // no longitude change
-        assert!(state.position.longitude - original.position.longitude < 0.00000001);
-        assert!(state.position.latitude - original.position.latitude > estimated_latitude_delta);
-        assert!(state.position.latitude - original.position.latitude < estimated_latitude_delta_ceil);
-        assert_eq!(state.track_angle_deg, 0.0);
-    }
 }
