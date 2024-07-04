@@ -5,10 +5,11 @@ use hyper::{
     Method, Request, StatusCode,
 };
 use packed_struct::PackedStruct;
+use svc_atc_client_rest::types::PointZ;
 use svc_telemetry_client_rest::netrid_types::*;
 use geo::prelude::*;
 use geo::point;
-use chrono::Utc;
+use lib_common::time::Utc;
 use crate::State;
 
 pub enum NetworkError {
@@ -218,34 +219,6 @@ pub(crate) async fn position_update(client: &Client<HttpConnector>, url: &str, t
     Ok(())
 }
 
-pub(crate) fn adjust_vertical_velocity(current_ms: &u64, state: &mut State) {
-    // println!("| {} | {current_ms} | adjusting velocity.", state.id);
-    // println!("| {} | {current_ms} | current location: {:?}", state.id, state.position);
-    let Some(ref plan) = state.current_plan else {
-        return;
-    };
-
-    let Some(ref next_point) = plan.path.get(0) else {
-        println!("| {} | {current_ms} | no more points in plan.", state.id);
-        return;
-    };
-
-    let p1 = point!(x: state.position.longitude, y: state.position.latitude);
-    let p2 = point!(x: next_point.longitude, y: next_point.latitude);
-    let distance = p1.haversine_distance(&p2); 
-    let time_to_next_point_s = distance / state.ground_velocity_m_s;
-
-    println!("| {} | {} | next point: {:?} in {} s", state.id, current_ms, next_point, time_to_next_point_s);
-    
-    state.vertical_velocity_m_s = (next_point.altitude_meters - state.position.altitude_meters) / time_to_next_point_s;
-    state.track_angle_deg = p1.haversine_bearing(p2);
-    if state.track_angle_deg < 0.0 {
-        state.track_angle_deg += 360.0;
-    }
-
-    println!("| {} | {} | adjusted velocity; hor m/s: {}, vert m/s: {}, bearing (deg): {}", state.id, current_ms, state.ground_velocity_m_s, state.vertical_velocity_m_s, state.track_angle_deg);
-}
-
 pub(crate) fn update_location(current_ms: &u64, last_ms: &u64, state: &mut State) {
     let Some(ref mut plan) = state.current_plan else {
         return;
@@ -262,6 +235,10 @@ pub(crate) fn update_location(current_ms: &u64, last_ms: &u64, state: &mut State
 
     state.position.longitude = p2.x();
     state.position.latitude = p2.y();
+    state.track_angle_deg = p1.haversine_bearing(p2);
+    if state.track_angle_deg < 0.0 {
+        state.track_angle_deg += 360.0;
+    }
 
     let Some(ref next_point) = plan.path.get(0) else {
         println!("| {} | {current_ms} | no more points in plan.", state.id);
@@ -269,16 +246,27 @@ pub(crate) fn update_location(current_ms: &u64, last_ms: &u64, state: &mut State
     };
 
     let p3 = point!(x: next_point.longitude, y: next_point.latitude);
+    let mut new_track_angle = p2.haversine_bearing(p3);
+    if new_track_angle < 0.0 {
+        new_track_angle += 360.0;
+    }
+
+    let flip: bool = (new_track_angle - state.track_angle_deg).abs() > 90.; // massive degree change; target behind
+
     // println!("| {} | {} | longitude: {}, latitude: {}, altitude: {}", state.id, current_ms, state.position.longitude, state.position.latitude, state.position.altitude_meters);
-    if p2.haversine_distance(&p3) >= 10.0 {
+    if !flip {
         return;
     }
 
     // Arrived at point
     println!("| {} | {} | arrived at intermediate point.", state.id, current_ms);
-    plan.path.remove(0);
+    state.position = PointZ {
+        longitude: next_point.longitude,
+        latitude: next_point.latitude,
+        altitude_meters: next_point.altitude_meters,
+    };
 
-    adjust_vertical_velocity(current_ms, state);
+    plan.path.pop_front();
 }
 
 #[cfg(test)]
@@ -292,8 +280,8 @@ mod tests {
     async fn test_update_location() {
         let mut state = State {
             current_plan: None,
-            id: uuid::Uuid::new_v4().to_string(),
-            scanner_id: uuid::Uuid::new_v4().to_string(),
+            id: Uuid::new_v4().to_string(),
+            scanner_id: Uuid::new_v4().to_string(),
             token: None,
             position: PointZ {
                 longitude: 5.167,
@@ -321,12 +309,12 @@ mod tests {
             target_timeslot_end: Utc::now(),
             target_timeslot_start: Utc::now(),
             aircraft_id: state.id.clone(),
-            flight_uuid: uuid::Uuid::new_v4().to_string(),
+            flight_uuid: Uuid::new_v4().to_string(),
             session_id: "AETH1234".to_string(),
-            origin_vertiport_id: uuid::Uuid::new_v4().to_string(),
-            target_vertiport_id: uuid::Uuid::new_v4().to_string(),
-            origin_vertipad_id: uuid::Uuid::new_v4().to_string(),
-            target_vertipad_id: uuid::Uuid::new_v4().to_string(),
+            origin_vertiport_id: Uuid::new_v4().to_string(),
+            target_vertiport_id: Uuid::new_v4().to_string(),
+            origin_vertipad_id: Uuid::new_v4().to_string(),
+            target_vertipad_id: Uuid::new_v4().to_string(),
             acquire: vec![],
             deliver: vec![]
         });

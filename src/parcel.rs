@@ -6,7 +6,7 @@ use hyper::{
     Method, Request, StatusCode,
 };
 
-use chrono::Utc;
+use lib_common::time::Utc;
 
 pub(crate) async fn parcel_scan(
     client: &Client<HttpConnector>,

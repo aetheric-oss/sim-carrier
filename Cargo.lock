@@ -2620,7 +2620,6 @@ name = "sim-carrier"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chrono",
  "clap",
  "config",
  "dotenv",
@@ -2636,7 +2635,6 @@ dependencies = [
  "svc-cargo-client-rest",
  "svc-telemetry-client-rest",
  "tokio",
- "uuid",
 ]
 
 [[package]]

@@ -4,7 +4,9 @@ use hyper::{
     client::Client,
 };
 use svc_telemetry_client_rest::netrid_types::*;
-use svc_atc_client_rest::types::*;
+use svc_atc_client_rest::types::{PointZ, Cargo, FlightPlan as AtcFlightPlan};
+use lib_common::time::{DateTime, Utc};
+use std::collections::{BinaryHeap, VecDeque};
 
 mod orders;
 mod parcel;
@@ -45,6 +47,44 @@ struct Args {
 const SLEEP_TIME_MS: u64 = 50;
 
 #[derive(Debug, Clone)]
+struct FlightPlan {
+    flight_uuid: String,
+    session_id: String,
+    origin_timeslot_start: DateTime<Utc>,
+    origin_timeslot_end: DateTime<Utc>,
+    target_timeslot_start: DateTime<Utc>,
+    // target_timeslot_end: DateTime<Utc>,
+    acquire: Vec<Cargo>,
+    deliver: Vec<Cargo>,
+    path: VecDeque<PointZ>,
+}
+
+impl From<AtcFlightPlan> for FlightPlan {
+    fn from(value: AtcFlightPlan) -> Self {
+        let mut path = VecDeque::new();
+        for point in value.path {
+            path.push_back(PointZ {
+                longitude: point.longitude,
+                latitude: point.latitude,
+                altitude_meters: point.altitude_meters,
+            });
+        }
+
+        FlightPlan {
+            flight_uuid: value.flight_uuid,
+            session_id: value.session_id,
+            origin_timeslot_start: value.origin_timeslot_start,
+            origin_timeslot_end: value.origin_timeslot_end,
+            target_timeslot_start: value.target_timeslot_start,
+            // target_timeslot_end: value.target_timeslot_end,
+            acquire: value.acquire,
+            deliver: value.deliver,
+            path
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct State {
     current_plan: Option<FlightPlan>,
     id: String,
@@ -57,8 +97,50 @@ struct State {
     last_update_ms: u64,
     last_id_update_ms: u64,
     last_order_check: u64,
-    // operational: bool, // for simulating sudden out of service
 }
+
+impl Default for State {
+    fn default() -> Self {
+        State {
+            current_plan: None,
+            id: String::new(),
+            scanner_id: String::new(),
+            token: None,
+            position: PointZ {
+                longitude: 0.0,
+                latitude: 0.0,
+                altitude_meters: 0.0,
+            },
+            ground_velocity_m_s: 0.0,
+            vertical_velocity_m_s: 0.0,
+            track_angle_deg: 0.0,
+            last_update_ms: 0,
+            last_id_update_ms: 0,
+            last_order_check: 0,
+        }
+    }
+}
+
+impl Ord for FlightPlan {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // min-heap
+        other.origin_timeslot_start.cmp(&self.origin_timeslot_start)
+    }
+}
+
+impl PartialOrd for FlightPlan {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for FlightPlan {
+    fn eq(&self, other: &Self) -> bool {
+        self.origin_timeslot_start == other.origin_timeslot_start
+    }
+}
+
+impl Eq for FlightPlan {}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -80,24 +162,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut state = State {
         id: identifier.clone(),
         scanner_id,
-        current_plan: None,
-        token: None,
         position: PointZ {
             longitude: args.longitude,
             latitude: args.latitude,
             altitude_meters: 0.0,
         },
-        ground_velocity_m_s: 0.0,
-        vertical_velocity_m_s: 0.0,
-        track_angle_deg: 0.0,
-        last_update_ms: 0,
-        last_id_update_ms: 0,
-        last_order_check: 0,
-        // operational: true,
+        ..Default::default()
     };
 
-    let mut plans: Vec<FlightPlan> = vec![];
-    let mut old_sessions: Vec<String> = vec![];
+    let mut plans: BinaryHeap<FlightPlan> = BinaryHeap::new();
+    let mut old_sessions: VecDeque<String> = VecDeque::new();
     let mut retry: u8 = 0;
 
     let client: Client<HttpConnector> = Client::builder()
@@ -105,37 +179,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_http();
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(SLEEP_TIME_MS));
-    let mut last_tick = chrono::Utc::now().timestamp_millis() as u64;
-    
+    let mut last_tick = Utc::now().timestamp_millis() as u64;
     loop {
         interval.tick().await;
-        let current_tick = chrono::Utc::now().timestamp_millis() as u64;
+        let current_tick = Utc::now().timestamp_millis() as u64;
         update_location(&current_tick, &last_tick, &mut state);
-        adjust_vertical_velocity(&current_tick, &mut state);
         last_tick = current_tick;
 
         // Check for new orders
-        if state.current_plan.is_none() {
-            let mut activate = false;
-            if let Some(ref fp) = plans.first() {
-                if (fp.origin_timeslot_end.timestamp_millis() as u64) < current_tick {
-                    activate = true;
-                }
-            }
-
-            if activate {
-                let plan = plans.remove(0);
-                orders::init_plan(&client, &mut state, &cargo_uri, current_tick, plan).await;
-            }
-        }
+        let _ = flight_plan_update(&client, &cargo_uri, &current_tick, &mut state, &mut plans).await;
 
         if let Some(ref plan) = state.current_plan {
             if plan.path.is_empty() {
-                old_sessions.push(plan.session_id.clone());
+                old_sessions.push_back(plan.session_id.clone());
                 orders::end_plan(&client, &mut state, &cargo_uri).await;
 
                 while old_sessions.len() > 10 {
-                    old_sessions.remove(0);
+                    old_sessions.pop_front();
                 }
             }
         }
@@ -227,21 +287,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
 
-                let mut in_place = false;
-                plans.iter_mut().for_each(|p| if p.session_id == order.session_id {
-                    *p = order.clone();
-                    in_place = true;
-                });
-
-                if !in_place {
-                    plans.push(order.clone());
+                if plans.iter().find(|p| p.session_id == order.session_id).is_none() {
+                    plans.push(order.clone())
                 }
 
                 let _ = orders::acknowledge_order(&client, &atc_uri, &order.flight_uuid, &identifier).await;
-                plans.sort_by(|a, b| a.origin_timeslot_start.cmp(&b.origin_timeslot_start));
             }
 
-            if let Some(ref plan) = plans.first() {
+            if let Some(ref plan) = plans.peek() {
                 let next_flight_s = (plan.origin_timeslot_end.timestamp_millis() as u64 - current_tick) / 1000;
                 println!("| {} | next flight time: {} (T-{} s)", state.id, plan.origin_timeslot_end, next_flight_s);
             }

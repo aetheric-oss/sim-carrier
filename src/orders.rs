@@ -4,7 +4,9 @@ use hyper::{
     client::Client,
     Method, Request, StatusCode,
 };
-use svc_atc_client_rest::types::*;
+use super::FlightPlan;
+use svc_atc_client_rest::types::{*, PointZ, FlightPlan as AtcFlightPlan};
+use std::collections::{BinaryHeap, VecDeque};
 
 use crate::State;
 use geo::prelude::*;
@@ -70,7 +72,7 @@ pub(crate) async fn get_orders(
     base_uri: &str,
     uuid: String,
     identifier: &str
-) -> Result<Vec<FlightPlan>, OrdersError> {
+) -> Result<VecDeque<FlightPlan>, OrdersError> {
     let url = format!("{base_uri}/plans");
 
     // println!("| {identifier} | acquiring plans from {url}.");
@@ -103,10 +105,13 @@ pub(crate) async fn get_orders(
         OrdersError::Other
     })?;
 
-    let plans = serde_json::from_slice::<Vec<FlightPlan>>(&body).map_err(|e| {
+    let plans: VecDeque<FlightPlan> = serde_json::from_slice::<VecDeque<AtcFlightPlan>>(&body).map_err(|e| {
         println!("({identifier}) could not parse plans: {}", e);
         OrdersError::Other
-    })?;
+    })?
+    .into_iter()
+    .map(|p| FlightPlan::from(p))
+    .collect();
 
     if !plans.is_empty() {
         println!("| {identifier} | acquired {} plans.", plans.len());
@@ -116,12 +121,44 @@ pub(crate) async fn get_orders(
     Ok(plans)
 }
 
+pub async fn flight_plan_update(
+    client: &Client<HttpConnector>,
+    cargo_uri: &str,
+    tick: &u64,
+    state: &mut State,
+    plans: &mut BinaryHeap<FlightPlan>,
+) -> Result<(), ()> {
+    if state.current_plan.is_some() {
+        return Ok(());
+    }
+
+    let fp: &FlightPlan = plans
+        .peek()
+        .ok_or_else(|| {
+            // println!("| {} | no flight plans available.", state.id);
+        })?;
+
+    
+    if fp.origin_timeslot_end.timestamp_millis() as u64 > *tick {
+        return Err(())
+    }
+
+    let plan = plans.pop()
+        .ok_or_else(|| {
+            // println!("| {} | no flight plans available.", state.id);
+        })?;
+    
+    init_plan(&client, state, &cargo_uri, tick, plan).await;
+
+    Ok(())
+}
+
 pub async fn init_plan(
     client: &Client<HttpConnector>,
     state: &mut State,
     cargo_uri: &str,
-    current_tick: u64,
-    plan: FlightPlan
+    current_tick: &u64,
+    mut plan: FlightPlan
 ) {
     println!("| {} | {current_tick} | new flight plan: {}", state.id, plan.session_id);
     for parcel in plan.acquire.iter() {
@@ -138,6 +175,7 @@ pub async fn init_plan(
 
     let total_distance: f64 = plan
         .path
+        .make_contiguous()
         .windows(2)
         .map(|ps| {
             let p1 = point!(x: ps[0].longitude, y: ps[0].latitude);
@@ -146,8 +184,40 @@ pub async fn init_plan(
         })
         .sum();
     
+    if plan.path.is_empty() {
+        return;
+    }
+
+    let Some(next_point) = plan.path.pop_front() else {
+        println!("| {} | no next point in plan.", state.id);
+        return;
+    };
+
+    // Hacky, jump the aircraft to first point of the plan
+    state.position = PointZ {
+        latitude: next_point.latitude,
+        longitude: next_point.longitude,
+        altitude_meters: next_point.altitude_meters,
+    };
+
+    let Some(next_point) = plan.path.get(0) else {
+        println!("| {} | no next point in plan.", state.id);
+        return;
+    };
+
     let total_duration_ms = (plan.target_timeslot_start.timestamp_millis() as u64) - current_tick;
     state.ground_velocity_m_s = total_distance / (total_duration_ms as f64 / 1000.0);
+    
+    let p1 = point!(x: state.position.longitude, y: state.position.latitude);
+    let p2 = point!(x: next_point.longitude, y: next_point.latitude);
+    let distance = p1.haversine_distance(&p2);
+    let time_to_next_point_s = distance / state.ground_velocity_m_s;
+    state.vertical_velocity_m_s = (next_point.altitude_meters - state.position.altitude_meters) / time_to_next_point_s;
+    state.track_angle_deg = p1.haversine_bearing(p2);
+    if state.track_angle_deg < 0.0 {
+        state.track_angle_deg += 360.0;
+    }
+
     state.current_plan = Some(plan);
 }
 
