@@ -35,6 +35,9 @@ check-cargo-registry:
 check-logs-dir:
 	if [ ! -d "$(SOURCE_PATH)/logs" ]; then mkdir -p "$(SOURCE_PATH)/logs" ; fi
 
+setup:
+	mkdir -p .ccache .simulator-gazebo
+
 build: check-cargo-registry
 	@$(call cargo_run,build)
 
@@ -43,3 +46,7 @@ release: check-cargo-registry
 
 test: check-cargo-registry
 	@$(call cargo_run,test)
+
+clean: check-cargo-registry
+	rm -rf .ccache .simulator-gazebo
+	@$(call cargo_run,clean)

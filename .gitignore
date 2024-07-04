@@ -1,3 +1,6 @@
 /target
 .cargo/
 .env
+.px4/
+.gazebo/
+.qgc/

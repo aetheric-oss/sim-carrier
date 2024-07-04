@@ -1,0 +1,92 @@
+services:
+  # separate PX4 from simulation package
+  #  so that we can launch multiple aircraft
+  #  without multiple gazebo instances
+  px4-base:
+    # image: px4io/px4-dev-nuttx-focal:latest # doesn't contain simulation packages
+    image: px4io/px4-dev-ros2-foxy:latest
+    working_dir: /src/PX4-Autopilot
+    user: ${USER_ID}:${GID}
+    volumes:
+      - ${PX4_AUTOPILOT_DIR}:/src/PX4-Autopilot:rw
+      - .px4/:/src/ccache:rw
+    environment:
+      CCACHE_DIR: /src/ccache # needed or else //.cacche/tmp permission error
+      HOME: /src/PX4-Autopilot # needed or else //.gitconfig permission error
+
+  px4-init:
+    container_name: sim-carrier-px4-init
+    extends: px4-base
+    command: >
+      /bin/bash -c "make px4_sitl_default"
+
+  px4:
+    container_name: sim-carrier-px4
+    extends: px4-base
+    depends_on:
+      px4-init:
+        condition: service_completed_successfully
+    links:
+      - gazebo
+      - qgroundcontrol
+    deploy:
+      mode: replicated
+      replicas: 1 # bump to create multiple aircraft
+    ports:
+      - 14550:14550 # ground control stations, each instance should increment this
+      - 14540:14540 # offboard APIs
+      - 18570:18570
+    environment:
+      PX4_SIM_HOSTNAME: sim-carrier-gazebo
+      PX4_SIMULATOR: GZ
+      PX4_GZ_STANDALONE: 1
+      PX4_GZ_MODEL_NAME: X4_GPS_RGBD
+      # PX4_SYS_AUTOSTART: 4001
+    command: bash -c "./build/px4_sitl_default/bin/px4"
+
+  gazebo:
+    image: gazebo:gzserver11-focal
+    container_name: sim-carrier-gazebo
+    hostname: sim-carrier-gazebo
+    working_dir: /
+    user: ${USER_ID}:${GID}
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      - .gazebo:/.gazebo:rw
+    healthcheck:
+      test: ["CMD", "curl", "--silent", "--fail", "http://localhost:4560"]
+    environment:
+      DISPLAY: ${DISPLAY}
+      GAZEBO_MASTER_URI: http://localhost:4560
+    ports:
+      - 4560:4560
+    command: >
+      bash -c "gazebo"
+
+  qgroundcontrol:
+    image: qgc-linux-docker # see README for build instructions
+    working_dir: /src/qgroundcontrol
+    volumes:
+      - ${QGC_DIR}:/src/qgroundcontrol
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      - .qgc:/.cache
+      - .qgc:/.config
+    user: ${USER_ID}:${GID}
+    environment:
+      DISPLAY: ${DISPLAY}
+    command: >
+      bash -c "./build/QGroundControl"
+
+  # MAVLINK Messages to the PX4 Platform
+  #  Phase out eventually
+  # carrier:
+  #   image: sim-carrier:latest
+  #   container_name: sim-carrier-logic
+    
